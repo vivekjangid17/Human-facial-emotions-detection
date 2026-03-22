@@ -1,0 +1,11 @@
+streamlit
+streamlit-webrtc
+tensorflow
+opencv-python-headless
+numpy
+pillow
+matplotlib
+seaborn
+scikit-learn
+gTTS
+av
