@@ -236,7 +236,6 @@ def display_results(result_img, emotions, confidences, enable_voice=True):
         try:
             audio_bytes = generate_tts_audio_bytes(speech_text)
             autoplay_audio(audio_bytes)
-            st.audio(audio_bytes, format="audio/mp3")
         except Exception as e:
             st.warning(f"Could not generate voice output: {e}")
             st.info("gTTS needs internet connection.")
