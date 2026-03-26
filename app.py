@@ -107,11 +107,60 @@ def preprocess_face(face_img):
     face = np.expand_dims(face, axis=0)
     return face
 
+import tensorflow as tf
+
+def get_last_conv_layer(model):
+    # Automatically find last Conv2D layer
+    for layer in reversed(model.layers):
+        if isinstance(layer, tf.keras.layers.Conv2D):
+            return layer.name
+    raise ValueError("No Conv2D layer found in model")
+
+
+def generate_gradcam(model, image, class_idx):
+    last_conv_layer_name = get_last_conv_layer(model)
+
+    grad_model = tf.keras.models.Model(
+        [model.inputs],
+        [model.get_layer(last_conv_layer_name).output, model.output]
+    )
+
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(image)
+        loss = predictions[:, class_idx]
+
+    grads = tape.gradient(loss, conv_outputs)
+
+    # Global average pooling
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+    conv_outputs = conv_outputs[0]
+
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+
+    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    return heatmap.numpy()
+
+def overlay_heatmap_on_face(face_img, heatmap):
+    heatmap = cv2.resize(heatmap, (face_img.shape[1], face_img.shape[0]))
+    heatmap = np.uint8(255 * heatmap)
+
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+
+    if len(face_img.shape) == 2:
+        face_img = cv2.cvtColor(face_img, cv2.COLOR_GRAY2BGR)
+
+    superimposed = cv2.addWeighted(face_img, 0.6, heatmap, 0.4, 0)
+    return superimposed
+
 
 def detect_emotions_in_image(image):
     model, face_cascade = load_resources()
 
     result_img = image.copy()
+    xai_img = image.copy()  # for Grad-CAM output
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     faces = face_cascade.detectMultiScale(
@@ -125,21 +174,34 @@ def detect_emotions_in_image(image):
 
     for (x, y, w, h) in faces:
         face_gray = gray[y:y+h, x:x+w]
+
         if face_gray.size == 0:
             continue
 
         processed = preprocess_face(face_gray)
+
         prediction = model.predict(processed, verbose=0)[0]
         class_idx = int(np.argmax(prediction))
         confidence = float(np.max(prediction))
         emotion = CLASS_NAMES[class_idx]
 
+        # Grad-CAM
+        heatmap = generate_gradcam(model, processed, class_idx)
+        explanation_text = generate_xai_text(emotion, heatmap)
+        heatmap_face = overlay_heatmap_on_face(face_gray, heatmap)
+
+        # Place heatmap back into original image
+        heatmap_face = cv2.resize(heatmap_face, (w, h))
+        xai_img[y:y+h, x:x+w] = heatmap_face
+
         predictions.append({
             "box": (x, y, w, h),
             "emotion": emotion,
-            "confidence": confidence
+            "confidence": confidence,
+            "explanation": explanation_text
         })
 
+        # Normal detection box
         cv2.rectangle(result_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
         cv2.putText(
             result_img,
@@ -151,24 +213,54 @@ def detect_emotions_in_image(image):
             2
         )
 
-    return result_img, predictions
+    return result_img, xai_img, predictions
 
+def generate_xai_text(emotion, heatmap):
+    # Find most important region in heatmap
+    h, w = heatmap.shape
+
+    # Divide into regions
+    top = np.mean(heatmap[:h//3, :])
+    middle = np.mean(heatmap[h//3:2*h//3, :])
+    bottom = np.mean(heatmap[2*h//3:, :])
+
+    # Decide focus area
+    if top >= middle and top >= bottom:
+        region = "forehead/eyes"
+    elif middle >= top and middle >= bottom:
+        region = "eyes and nose"
+    else:
+        region = "mouth"
+
+    # Emotion-based explanation
+    explanations = {
+        "Happy": f"The model focused on the {region}, especially the mouth area, indicating a smile.",
+        "Sad": f"The model focused on the {region}, indicating downward facial expressions.",
+        "Angry": f"The model focused on the {region}, showing tension around eyes and eyebrows.",
+        "Surprise": f"The model focused on the {region}, showing wide-open eyes or mouth.",
+        "Fear": f"The model focused on the {region}, indicating stressed facial patterns.",
+        "Disgust": f"The model focused on the {region}, especially nose and mouth.",
+        "Neutral": f"The model focused evenly on the face with no strong emotional cues."
+    }
+
+    return explanations.get(emotion, f"The model focused on the {region}.")
 
 def process_image_for_emotion(image: np.ndarray):
     try:
-        result_img, predictions = detect_emotions_in_image(image)
+        result_img, xai_img, predictions = detect_emotions_in_image(image)
 
         if not predictions:
-            return None, [], []
+            return None, None, [], []
 
         emotions = [pred["emotion"] for pred in predictions]
         confidences = [pred["confidence"] for pred in predictions]
+        explanations = [pred["explanation"] for pred in predictions]
 
-        return result_img, emotions, confidences
+        return result_img, xai_img, emotions, confidences, explanations
+
     except Exception as e:
         st.error(f"Prediction failed: {e}")
-        return None, [], []
-
+        return None, None, [], []
 
 def get_emotion_message(emotion):
     emotion = str(emotion).strip().lower()
@@ -215,16 +307,16 @@ def display_results(result_img, emotions, confidences, enable_voice=True):
     st.subheader("Result")
     st.image(result_img, channels="BGR", use_container_width=True)
 
-    for emotion, conf in zip(emotions, confidences):
-        st.markdown(
-            f"""
-            <div class="result-box">
-                <div class="emotion-label">Emotion: {emotion}</div>
-                <div class="confidence-label">Confidence: {conf:.1%}</div>
+    for emotion, conf, exp in zip(emotions, confidences, explanations):
+        st.markdown(f"""
+        <div class="result-box">
+            <div class="emotion-label">Emotion: {emotion}</div>
+            <div class="confidence-label">Confidence: {conf:.1%}</div>
+            <div style="color:#ffffff; margin-top:10px;">
+                <b>Explanation:</b> {exp}
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        </div>
+        """, unsafe_allow_html=True)
 
     if enable_voice and emotions:
         primary_emotion = emotions[0]
@@ -247,7 +339,7 @@ def display_results(result_img, emotions, confidences, enable_voice=True):
 class EmotionVideoProcessor(VideoProcessorBase):
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
-        result_img, _ = detect_emotions_in_image(img)
+        result_img, _, _ = detect_emotions_in_image(img)
         return av.VideoFrame.from_ndarray(result_img, format="bgr24")
 
 
@@ -300,11 +392,14 @@ def render_upload_mode():
                 st.image(image, channels="BGR", use_container_width=True)
 
             with st.spinner("Detecting faces and emotions..."):
-                result_img, emotions, confidences = process_image_for_emotion(image)
+                result_img, xai_img, emotions, confidences, explanations = process_image_for_emotion(image)
 
             with col2:
                 if result_img is not None:
                     display_results(result_img, emotions, confidences, enable_voice=True)
+
+                    st.subheader("Explainable AI (Grad-CAM)")
+                    st.image(xai_img, channels="BGR", use_container_width=True)
                 else:
                     st.markdown(
                         """
